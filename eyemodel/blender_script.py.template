@@ -264,6 +264,12 @@ compositing_tree.nodes["Shot Noise"].inputs[0].default_value[1] = cam_rand.unifo
 
 scene.update()
 
+if output_mesh_path:
+    left_eye = bpy.data.objects['eye.L']
+    left_eye.select = True
+    bpy.context.scene.objects.active = left_eye
+    bpy.ops.export_mesh.stl(output_mesh_path, ascii=True)
+
 # Use CUDA if possible
 if input_use_cuda and bpy.context.user_preferences.system.compute_device_type != 'CUDA':
     try:

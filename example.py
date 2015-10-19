@@ -42,4 +42,5 @@ with eyemodel.Renderer() as r:
     ]
 
     r.render_samples = 50
-    r.render("example.png", "example.m")
+    # r.render("example.png", "example.m")
+    r.export_mesh("test.stl")

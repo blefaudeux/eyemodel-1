@@ -47,7 +47,7 @@ RENDER_LINE_RE = re.compile(r"""
     \s*,\s*
     Sample \s+
         (?P<sample>\d+)/(?P<samples>\d+)            # Sample num
-    \s*
+    \s*x
 """, flags=re.VERBOSE)
 
 
@@ -143,6 +143,184 @@ class Renderer():
         self.render_seed = None
 
         self.camera_noise_seed = None
+
+    def export_mesh(self, path):
+        new_ireye_path = os.path.join(TEXTURE_PATH, "ireye-{}.png".format(self.iris))
+        if not os.path.exists(new_ireye_path):
+            raise RuntimeError("Eye texture {} does not exist. Create one in the textures folder.".
+                               format("ireye-{}.png". format(self.iris)))
+
+        with open(BLENDER_SCRIPT_TEMPLATE) as blender_script_template_file:
+            blender_script_template = blender_script_template_file.read()
+        blender_script_template = blender_script_template.replace("{", "{{")
+        blender_script_template = blender_script_template.replace("}", "}}")
+        blender_script_template = blender_script_template.replace("$INPUTS", "{}")
+
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as blender_err_file:
+                blender_err_file_name = blender_err_file.name
+
+            inputs = {
+                "input_eye_radius": self.eye_radius,
+                "input_eye_pos": "Vector({})".format(list(self.eye_position)),
+                "input_eye_target": "Vector({})".format(list(self.eye_target)),
+                "input_eye_up": "Vector({})".format(list(self.eye_up)),
+                "input_eye_closedness": self.eye_closedness,
+
+                "input_iris": "'{}'".format(self.iris),
+
+                "input_eye_cornea_refrative_index": self.cornea_refractive_index,
+
+                "input_lights": ["Light({})".format(
+                        ",".join("{}={}".format(k,v) for k,v in
+                            {
+                                "location": "Vector({})".format(list(l.location)),
+                                "target": "Vector({})".format(list(l.target)),
+                                "type": '"{}"'.format(l.type),
+                                "size": l.size,
+                                "strength": l.strength,
+                                "view_angle": l.view_angle
+                            }.items())) for l in self.lights],
+
+                "input_pupil_radius": self.pupil_radius,
+            }
+
+            inputs["output_mesh_path"] = "'{}'".format(path).replace("\\","/")
+
+            def inputVal(v):
+                if isinstance(v,list):
+                    return '[{}]'.format(",".join(inputVal(x) for x in v))
+                else:
+                    return str(v)
+
+            blender_script = blender_script_template.format("\n".join("{} = {}".format(k, inputVal(v))
+                                                                      for k, v in inputs.items()))
+
+            blender_script = "\n".join("    " + x for x in blender_script.split("\n"))
+            blender_script = ("import sys\ntry:\n" + blender_script + "\nexcept:"
+                              "\n    import traceback"
+                              "\n    with open(r'" + blender_err_file.name + "','a') as f:"
+                              "\n        f.write('\\n'.join(traceback.format_exception(*sys.exc_info())))"
+                              "\n    sys.exit(1)")
+
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as blender_script_file:
+                blender_script_file.write(blender_script)
+
+            try:
+                with tempfile.NamedTemporaryFile(suffix="0000", delete=False) as blender_outfile:
+                    pass
+
+                blender_args = [get_blender_path(),
+                                MODEL_PATH,                              # Load model
+                                "--enable-autoexec",                     # Automatic python script execution
+                                "--verbose", "0",                        # No debug output
+                                "--python", blender_script_file.name,    # Run the temporary blender script file
+                                "-o", blender_outfile.name[:-4]+"####",  # Render output to temporary file
+                                "-noaudio",                              # Don't use audio
+                                "--use-extension", "0",                  # Don't append the file extension
+                                "--background"]                          # Load the file in the background (no UI)
+
+                try:
+                    def enqueue_output(out, queue, name):
+                        for line in iter(out.readline, b''):
+                            line = line.rstrip()
+                            if sys.version_info.major >= 3:
+                                line = line.decode("utf-8")
+                            queue.put((name, line))
+                        out.close()
+
+                    if hasattr(os.sys, 'winver'):
+                        p = subprocess.Popen(blender_args, bufsize=0, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                    else:
+                        p = subprocess.Popen(blender_args, bufsize=0, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+                    q = Queue()
+                    tout = threading.Thread(target=enqueue_output, args=(p.stdout, q, "out"))
+                    tout.daemon = True  # thread dies with the program
+                    terr = threading.Thread(target=enqueue_output, args=(p.stderr, q, "err"))
+                    terr.daemon = True  # thread dies with the program
+                    tout.start()
+                    terr.start()
+
+                    print("Starting blender")
+
+                    while tout.isAlive() or terr.isAlive():
+                        try:
+                            line = q.get(timeout=0.1)
+                        except Empty:
+                            pass
+                        else:
+                            if line[0] == "out":
+                                m = RENDER_LINE_RE.match(line[1])
+                                if m:
+                                    tile = int(m.group("tile"))
+                                    tiles = int(m.group("tiles"))
+                                    sample = int(m.group("sample"))
+                                    samples = int(m.group("samples"))
+                                    print("Rendered {percent}%, time remaining: {rem} (tile {tile}/{tiles}, sample {sample}/{samples})".format(
+                                        percent=100 * ((tile-1)*samples + (sample-1)) / (tiles*samples),
+                                        **m.groupdict()
+                                    ))
+
+                            with open(blender_err_file_name, "a") as blender_err_file:
+                                blender_err_file.write(line[0])
+                                blender_err_file.write(" | ")
+                                blender_err_file.write(line[1])
+                                blender_err_file.write("\n")
+
+                    if p.wait() != 0:
+                        print("Blender error")
+                        raise subprocess.CalledProcessError(p.returncode, blender_args)
+
+                    print("Blender quit")
+
+                except KeyboardInterrupt:
+                    raise
+                except:
+                    # Sometimes blender fails in rendering, so retry until success
+                    traceback.print_exc()
+                    if attempt < attempts:
+                        print("Blender call failed, retrying in 1 sec (attempt {} of {})".format(attempt, attempts))
+                        try:
+                            sleep_fail = True
+                            time.sleep(1)
+                            sleep_fail = False
+                        except:
+                            pass
+                        if sleep_fail:
+                            raise
+                    else:
+                        print("Blender call failed")
+                        raise
+                finally:
+                    if p.poll() is None:
+                        print("Killing blender")
+                        if hasattr(os.sys, 'winver'):
+                            os.kill(p.pid, signal.CTRL_BREAK_EVENT)
+                        else:
+                            p.send_signal(signal.SIGKILL)
+                        p.wait()
+                        print("Blender killed")
+
+                    if os.path.exists(path):
+                        os.remove(path)
+                    shutil.move(blender_outfile.name, path)
+                    print(("Moved mesh to {}".format(path)))
+
+            except:
+                with open(blender_err_file_name) as blender_err_file:
+                    print(blender_err_file.read())
+
+                raise
+
+            finally:
+                if os.path.exists(blender_outfile.name):
+                    os.remove(blender_outfile.name)
+        finally:
+            # Sleep for a short time to let file handles get free'd
+            time.sleep(0.1)
+            os.remove(blender_err_file.name)
+            os.remove(blender_script_file.name)
 
     def render(self, path, params=None, background=True, cuda=True, attempts=5):
         __, ext = os.path.splitext(path)
